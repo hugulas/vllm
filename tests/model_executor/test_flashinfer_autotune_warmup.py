@@ -354,12 +354,8 @@ def test_sparse_autotune_respects_cache_selection(
         sparse, "_flashinfer_sparse_mla_decode_label", lambda *_: "DSv3.2"
     )
     monkeypatch.setattr(sparse, "resolve_flashinfer_autotune_v2_root", lambda: tmp_path)
-    cache_path = tmp_path / "autotune.json"
-    cache_path.write_bytes(b"cached")
-    monkeypatch.setattr(
-        sparse, "resolve_flashinfer_autotune_file", lambda _: cache_path
-    )
-    monkeypatch.setattr(sparse, "flashinfer_autotune", legacy)
+    monkeypatch.setattr(sparse, "autotune_sparse_mla_only", legacy)
+    monkeypatch.setattr(sparse, "_sparse_mla_refine_tokens", lambda _: ())
 
     def mixed_warmup(*args, mixed_step_context=None, **kwargs):
         context = (
@@ -383,11 +379,9 @@ def test_sparse_autotune_respects_cache_selection(
     else:
         managed.assert_not_called()
         reload.assert_not_called()
-        assert legacy.call_count == (1 if rank == 0 else 0)
-        world.broadcast_object.assert_called_once_with(
-            b"cached" if rank == 0 else None, src=0
-        )
-        tuner.load_configs.assert_called_once_with(str(cache_path))
+        legacy.assert_called_once()
+        world.broadcast_object.assert_not_called()
+        tuner.load_configs.assert_not_called()
     assert mixed.call_count == (1 if model_runner_v2 and max_reqs >= 2 else 0)
     assert runner._dummy_run.call_count == (0 if mixed.called else 1)
 
