@@ -61,6 +61,7 @@ from vllm.v1.engine.output_processor import (
     OutputProcessor,
     RequestOutputCollector,
     StreamingInputOutputCollector,
+    reasoning_parser_cls_from_config,
 )
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
@@ -181,6 +182,7 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            reasoning_parser_cls=reasoning_parser_cls_from_config(self.vllm_config),
             admission_stats=self.admission_stats,
         )
 
