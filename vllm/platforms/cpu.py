@@ -548,6 +548,7 @@ class CpuPlatform(Platform):
         model_config = vllm_config.model_config
         if model_config is None:
             return
+        simulated = vllm_config.simulation_config.simulate_forward
         backend_classes = cls._find_non_ssm_backends(vllm_config)
         if not backend_classes:
             return
@@ -557,7 +558,6 @@ class CpuPlatform(Platform):
         cache_config = vllm_config.cache_config
         if not cache_config.user_specified_block_size:
             # A simulation takes the minimum, the closest to the GPU default.
-            simulated = vllm_config.simulation_config.simulate_forward
             cache_config.block_size = cls._preferred_block_size_for_backends(
                 backend_classes,
                 _CPU_ATTN_BLOCK_MULTIPLE if simulated else 128,
@@ -569,6 +569,12 @@ class CpuPlatform(Platform):
         # reconcile attention and mamba page sizes
         pre_block_size = cache_config.block_size
         cls._align_hybrid_block_size(vllm_config, backend_classes[0])
+        if simulated:
+            # Simulated execution needs the aligned hybrid page size for KV
+            # capacity accounting, but allocates no KV tensors and never calls
+            # the host attention kernel. A CPU backend may therefore reject a
+            # target-GPU page size without making the simulation invalid.
+            return
         cls._check_aligned_block_size(vllm_config, backend_classes, pre_block_size)
 
     @classmethod

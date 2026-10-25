@@ -102,6 +102,18 @@ def apply_trace_tokens(
 ) -> None:
     """Overwrite ``sampled`` in place with trace tokens for the current step."""
     num_reqs = idx_mapping.shape[0]
+    if sampled.device.type == "cpu":
+        for batch_idx in range(num_reqs):
+            req_idx = int(idx_mapping[batch_idx])
+            if req_idx < 0:
+                continue
+            length = int(trace_len[req_idx])
+            if length <= 0:
+                continue
+            step = int(total_len[req_idx]) - int(prompt_len[req_idx])
+            if 0 <= step < length:
+                sampled[batch_idx] = trace_token_ids[req_idx, step]
+        return
     _trace_replay_kernel[(num_reqs,)](
         sampled,
         idx_mapping,

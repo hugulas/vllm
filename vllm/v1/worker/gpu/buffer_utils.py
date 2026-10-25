@@ -198,6 +198,25 @@ class StagedWriteTensor:
         if n == 0:
             return
 
+        if self.device.type == "cpu":
+            content_start = 0
+            for index, start, content_end in zip(
+                self._staged_write_indices,
+                self._staged_write_starts,
+                self._staged_write_cu_lens,
+            ):
+                values = self._staged_write_contents[content_start:content_end]
+                dst = self.gpu[index]
+                if dst.ndim == 0:
+                    dst.copy_(torch.as_tensor(values[0], dtype=self.dtype))
+                else:
+                    dst[start : start + len(values)].copy_(
+                        torch.as_tensor(values, dtype=self.dtype)
+                    )
+                content_start = content_end
+            self.clear_staged_writes()
+            return
+
         indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
@@ -274,6 +293,11 @@ class FusedStagedWriter:
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
 
         if not group_ids:
+            return
+
+        if self.device.type == "cpu":
+            for tensor in tensors:
+                tensor.apply_write()
             return
 
         group_ids_uva = self.group_ids.copy_to_uva(group_ids)

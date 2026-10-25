@@ -329,6 +329,25 @@ def prepare_prefill_inputs(
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     num_lookahead = next_prefill_tokens.shape[0]
+    if input_ids.device.type == "cpu":
+        for batch_idx in range(num_reqs):
+            req_idx = int(idx_mapping[batch_idx])
+            computed = int(num_computed_tokens[req_idx])
+            prompt_len = int(prefill_len[req_idx])
+            if computed >= prompt_len:
+                continue
+            start = int(query_start_loc[batch_idx])
+            end = int(query_start_loc[batch_idx + 1])
+            query_len = end - start
+            input_ids[start:end].copy_(
+                all_token_ids[req_idx, computed : computed + query_len]
+            )
+            for lookahead in range(num_lookahead):
+                pos = computed + query_len + lookahead
+                next_prefill_tokens[lookahead, req_idx] = (
+                    all_token_ids[req_idx, pos] if pos < prompt_len else 0
+                )
+        return
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         input_ids,
         next_prefill_tokens,
@@ -390,6 +409,19 @@ def prepare_pos_seq_lens(
     seq_lens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if pos.device.type == "cpu":
+        seq_lens.zero_()
+        for req_id in range(num_reqs):
+            req_idx = int(idx_mapping[req_id])
+            computed = int(num_computed_tokens[req_idx])
+            start = int(query_start_loc[req_id])
+            end = int(query_start_loc[req_id + 1])
+            query_len = end - start
+            seq_lens[req_id] = computed + query_len
+            pos[start:end] = torch.arange(
+                computed, computed + query_len, dtype=pos.dtype, device=pos.device
+            )
+        return
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
@@ -484,6 +516,33 @@ def combine_sampled_and_draft_tokens(
     num_speculative_steps = draft_tokens.shape[-1]
 
     logits_indices = torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
+    if input_ids.device.type == "cpu":
+        for batch_idx in range(num_reqs):
+            req_idx = int(idx_mapping[batch_idx])
+            logits_begin = int(cu_num_logits[batch_idx])
+            logits_end = int(cu_num_logits[batch_idx + 1])
+            req_num_logits = logits_end - logits_begin
+            query_end = int(query_start_loc[batch_idx + 1])
+            logits_start = query_end - req_num_logits
+            logits_indices[logits_begin:logits_end] = torch.arange(
+                logits_start,
+                query_end,
+                dtype=logits_indices.dtype,
+                device=logits_indices.device,
+            )
+            seq_len = int(seq_lens[batch_idx])
+            req_prefill_len = int(prefill_len[req_idx])
+            if seq_len <= req_prefill_len:
+                continue
+            first_logit_seq_pos = seq_len - req_num_logits
+            if num_new_sampled_tokens and first_logit_seq_pos >= req_prefill_len:
+                input_ids[logits_start] = last_sampled_tokens[req_idx, 0]
+            num_draft_tokens = req_num_logits - num_new_sampled_tokens
+            if num_draft_tokens > 0:
+                input_ids[query_end - num_draft_tokens : query_end].copy_(
+                    draft_tokens[req_idx, :num_draft_tokens]
+                )
+        return logits_indices
     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
         input_ids,
         idx_mapping,
@@ -638,6 +697,30 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if idx_mapping.device.type == "cpu":
+        for req_id in range(num_reqs):
+            req_idx = int(idx_mapping[req_id])
+            if req_idx < 0:
+                continue
+            old_total = int(total_len[req_idx])
+            sampled_count = int(num_sampled[req_id])
+            if sampled_count > 0:
+                tokens = sampled_tokens[req_id, :sampled_count]
+                last_sampled_tokens[req_idx] = tokens[-1]
+                all_token_ids[
+                    req_idx, old_total : old_total + sampled_count
+                ].copy_(tokens.to(all_token_ids.dtype))
+                total_len[req_idx] = old_total + sampled_count
+                if output_bin_counts is not None:
+                    for token_id in tokens.tolist():
+                        output_bin_counts[req_idx, token_id] += 1
+            query_len = 0
+            if query_start_loc is not None:
+                query_len = int(query_start_loc[req_id + 1]) - int(
+                    query_start_loc[req_id]
+                )
+            num_computed_tokens[req_idx] += query_len - int(num_rejected[req_id])
+        return
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,

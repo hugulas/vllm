@@ -7,12 +7,15 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field, field_validator
 
 from vllm.config.utils import config, hash_factors
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config.vllm import VllmConfig
 
 _SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 _RECORDING_WORKER = "vllm.v1.worker.simulated.recording.RecordingWorker"
+
+logger = init_logger(__name__)
 
 
 @config
@@ -124,6 +127,23 @@ class SimulationConfig:
             raise ValueError("Simulated forward does not support weight transfer.")
         if vllm_config.model_config.runner_type != "generate":
             raise ValueError("Simulated forward supports generation runners only.")
+        if (
+            current_platform.is_cpu()
+            and vllm_config.model_config.quantization is not None
+        ):
+            # Simulated execution constructs a dummy/meta model only to recover
+            # model and KV-cache structure; it never runs the selected weight
+            # kernels. CPU logical ranks therefore must not select a GPU-only
+            # checkpoint quantization backend (for example Kimi-K3 MXFP4).
+            # The TimingProvider still receives the independently configured
+            # target model/quantization and remains responsible for device time.
+            logger.warning(
+                "Ignoring runtime quantization=%s for CPU simulated execution; "
+                "the timing provider owns target-device quantization.",
+                vllm_config.model_config.quantization,
+            )
+            vllm_config.model_config.quantization = None
+            vllm_config.quant_config = None
         if self.clock != "real" and parallel.world_size_across_dp > 1:
             raise ValueError(
                 f"The {self.clock} simulation clock supports one rank, not "

@@ -18,6 +18,9 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -27,6 +30,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import post_update
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.simulated.kv_transfer import (
     SimulatedTransfers,
@@ -62,6 +66,53 @@ _WARMUP_REQ_ID = "__simulated_warmup__"
 _WARMUP_PROMPT_LEN = 2
 # The draft token id the runner reports for drafts it does not propose.
 _PLACEHOLDER_DRAFT = -1
+
+
+class _SimulatedFusedMoEMethod(FusedMoEMethodBase):
+    """Structure-only MoE method for CPU simulated execution.
+
+    A simulated runner builds the model on ``meta`` only so attention layers
+    can register their KV-cache specifications. It never executes or loads
+    expert weights. Selecting a real FusedMoE kernel on a CPU logical rank is
+    therefore both unnecessary and, for GPU-only models such as Kimi-K3,
+    impossible.
+
+    This deliberately implements only the construction-time protocol used by
+    ``RoutedExperts``. Any accidental forward call fails loudly.
+    """
+
+    requires_device_loading = False
+    supports_pre_processed_weights = True
+
+    def __init__(self, moe):
+        super().__init__(moe)
+
+    @property
+    def supports_eplb(self) -> bool:
+        return True
+
+    def create_weights(self, layer, **kwargs) -> None:
+        # There are no weights in simulated execution (load device is meta),
+        # and no checkpoint loader needs expert parameter names (load=dummy).
+        return None
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        *args,
+        **kwargs,
+    ) -> tuple[int, int]:
+        return hidden_size, intermediate_size_per_partition
+
+    def get_fused_moe_quant_config(self, layer):
+        return None
+
+    def apply(self, *args, **kwargs):
+        raise RuntimeError("Simulated MoE placeholder cannot execute a forward pass")
+
+    def apply_monolithic(self, *args, **kwargs):
+        raise RuntimeError("Simulated MoE placeholder cannot execute a forward pass")
 
 
 @dataclass
@@ -129,6 +180,28 @@ class SimulatedModelRunner(GPUModelRunner):
                 rates = acceptance_rates_from_log(rates)
             self._acceptance_rates = np.asarray(rates, dtype=np.float64)
             logger.info("Draft acceptance rates by position: %s", rates)
+
+    def load_model(self, *args, **kwargs) -> None:  # type: ignore[override]
+        if self.device.type != "cpu":
+            return super().load_model(*args, **kwargs)
+
+        # Keep construction of the real model skeleton: its Attention modules
+        # populate static_forward_context, which is the source of truth for KV
+        # sizing. Only suppress selection and allocation of an unused MoE
+        # kernel/weights. The patch is process-local and restored as soon as
+        # model construction finishes.
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+        original = RoutedExperts._get_quant_method
+
+        def simulated_quant_method(_layer, _prefix, _quant_config, moe_config):
+            return _SimulatedFusedMoEMethod(moe_config)
+
+        RoutedExperts._get_quant_method = simulated_quant_method
+        try:
+            super().load_model(*args, **kwargs)
+        finally:
+            RoutedExperts._get_quant_method = original
 
     def initialize_kv_cache_tensors(
         self,
@@ -378,6 +451,37 @@ class SimulatedModelRunner(GPUModelRunner):
         output.kv_connector_output = self._post_forward(pending.finished_req_ids)
         self._last_output = SimulatedAsyncOutput(output, pending.t_deadline, self.clock)
         return self._last_output
+
+    def postprocess_sampled(  # type: ignore[override]
+        self,
+        idx_mapping: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor | None = None,
+    ) -> None:
+        """Update request bookkeeping without model-forward-only state.
+
+        Hybrid model states maintain recurrent tensors for the next real
+        forward. Simulated execution has neither those tensors nor a forward,
+        so only the scheduler-visible token state must be updated.
+        """
+        output_bin_counts = None
+        if self.is_last_pp_rank:
+            assert self.sampler is not None
+            output_bin_counts = self.sampler.penalties_state.output_bin_counts
+        post_update(
+            idx_mapping,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            output_bin_counts,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.total_len.gpu,
+        )
 
     def _post_forward(self, finished_req_ids: set[str]) -> KVConnectorOutput | None:
         """Run the KV connector's end-of-step hooks: submit this step's loads
