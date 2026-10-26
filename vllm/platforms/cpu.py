@@ -531,6 +531,7 @@ class CpuPlatform(Platform):
             model_config is not None
             and model_config.use_mla
             and not amx_mla_or_dsv4_enabled
+            and not simulated
         ):
             logger.info_once(
                 "MLA is enabled on a non-GPU platform; forcing chunked "

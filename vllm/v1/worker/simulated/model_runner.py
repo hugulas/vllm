@@ -187,21 +187,32 @@ class SimulatedModelRunner(GPUModelRunner):
 
         # Keep construction of the real model skeleton: its Attention modules
         # populate static_forward_context, which is the source of truth for KV
-        # sizing. Only suppress selection and allocation of an unused MoE
-        # kernel/weights. The patch is process-local and restored as soon as
+        # sizing. Suppress unused MoE kernels and select a structure-only
+        # sparse MLA backend. Patches are process-local and restored as soon as
         # model construction finishes.
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
+        from vllm.model_executor.layers.attention import mla_attention
+        from vllm.v1.worker.simulated.sparse_mla import SimulatedSparseMLABackend
+
         original = RoutedExperts._get_quant_method
+        original_mla_backend = mla_attention.get_attn_backend
+
+        def simulated_mla_backend(*backend_args, **backend_kwargs):
+            if backend_kwargs.get("use_sparse"):
+                return SimulatedSparseMLABackend
+            return original_mla_backend(*backend_args, **backend_kwargs)
 
         def simulated_quant_method(_layer, _prefix, _quant_config, moe_config):
             return _SimulatedFusedMoEMethod(moe_config)
 
         RoutedExperts._get_quant_method = simulated_quant_method
+        mla_attention.get_attn_backend = simulated_mla_backend
         try:
             super().load_model(*args, **kwargs)
         finally:
             RoutedExperts._get_quant_method = original
+            mla_attention.get_attn_backend = original_mla_backend
 
     def initialize_kv_cache_tensors(
         self,

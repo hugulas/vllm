@@ -159,6 +159,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             self.block_size,
             self.head_dim,
             self.kv_cache_dtype,
+            simulate_forward=vllm_config.simulation_config.simulate_forward,
         )
         self._set_isa_to_layers(layer_names)
         self.is_cross_attention = isinstance(kv_cache_spec, CrossAttentionSpec)
@@ -202,6 +203,8 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CPUAttentionMetadata:
+        if self.isa == "simulated":
+            raise RuntimeError("Simulated execution cannot build CPU kernel metadata")
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
@@ -522,7 +525,11 @@ def _get_attn_isa(
     block_size: int,
     head_size: int | None = None,
     kv_cache_dtype: str | None = None,
+    *,
+    simulate_forward: bool = False,
 ) -> str:
+    if simulate_forward:
+        return "simulated"
     fp8_kv = is_quantized_kv_cache(kv_cache_dtype) if kv_cache_dtype else False
     if head_size is not None and head_size % 32 != 0 and head_size % 16 == 0:
         if fp8_kv:
